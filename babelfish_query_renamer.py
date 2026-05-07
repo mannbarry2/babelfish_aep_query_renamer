@@ -462,70 +462,119 @@ def looks_like_valid_sql(sql: str) -> bool:
     return first in _SQL_FIRST_WORDS
 
 
-def write_mega_markdown(templates: list[dict], dest_dir: Path) -> Path:
-    """Combine every (syntactically valid) template's SQL into a single
-    Markdown file at dest_dir/all_queries_mega_file.md, grouped by sandbox.
-    The manifest at the top lists the sandboxes the queries came from."""
+def _now_iso() -> str:
+    """Local time with timezone offset, second precision -- e.g.
+    '2026-05-07T14:00:00+01:00'. Goes into snapshot + mega-file headers."""
     from datetime import datetime
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    md_path = dest_dir / "all_queries_mega_file.md"
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
-    by_sandbox: dict[str, list[dict]] = {}
-    skipped: list[dict] = []
-    for t in templates:
-        if not looks_like_valid_sql(t.get("sql", "") or ""):
-            skipped.append(t)
-            continue
-        sb = t.get("_sandbox", "?")
-        by_sandbox.setdefault(sb, []).append(t)
+
+def write_tenant_snapshot(templates: list[dict], dest_dir: Path) -> Path:
+    """Persist this run's full template list (every sandbox, every owner) to a
+    JSON snapshot at dest_dir/_snapshot.json. The cross-tenant mega writer
+    reads these from each tenant's folder so a single file can span every
+    Adobe org you've ever run against."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = dest_dir / "_snapshot.json"
+    snapshot = {
+        "tenant":        TENANT,
+        "org_id":        ORG_ID,
+        "generated_at":  _now_iso(),
+        "script":        f"{SCRIPT_NAME} v{SCRIPT_VERSION}",
+        "sandboxes":     sorted({t.get("_sandbox", "?") for t in templates}),
+        "templates": [
+            {
+                "id":       t.get("id", ""),
+                "name":     t.get("name", "") or "(unnamed)",
+                "sandbox":  t.get("_sandbox", "?"),
+                "userId":   t.get("userId", ""),
+                "created":  t.get("created", ""),
+                "updated":  t.get("updated", ""),
+                "sql":      t.get("sql", "") or "",
+            }
+            for t in templates
+        ],
+    }
+    snapshot_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+    return snapshot_path
+
+
+def write_cross_tenant_mega_markdown(sql_root: Path) -> Path:
+    """Read every tenant's _snapshot.json under sql_root and assemble ONE
+    cross-tenant Markdown file at sql_root/all_queries_mega_file.md. Each run
+    refreshes its own tenant snapshot; other tenants' snapshots are preserved,
+    so the mega file accumulates a complete cross-org archive."""
+    snapshots: list[dict] = []
+    for snap_path in sorted(sql_root.glob("*/_snapshot.json")):
+        try:
+            snapshots.append(json.loads(snap_path.read_text(encoding="utf-8")))
+        except Exception as e:
+            step("ERROR", f"Skipping malformed snapshot {snap_path}: {e}")
+
+    md_path = sql_root / "all_queries_mega_file.md"
 
     lines: list[str] = []
-    lines.append(f"# AEP Query Templates - {TENANT}")
+    lines.append("# AEP Query Templates - All Tenants")
     lines.append("")
     lines.append("## Manifest")
     lines.append("")
-    lines.append(f"- Generated: {datetime.now().isoformat(timespec='seconds')}")
-    lines.append(f"- Tenant: `{TENANT}`")
-    lines.append(f"- Org ID: `{ORG_ID}`")
-    sb_list = sorted(by_sandbox)
-    lines.append(f"- Sandboxes ({len(sb_list)}): "
-                 + ", ".join(f"`{s}` ({len(by_sandbox[s])})" for s in sb_list))
-    lines.append(f"- Templates included: {sum(len(v) for v in by_sandbox.values())}")
-    if skipped:
-        lines.append(f"- Skipped (no valid SQL): {len(skipped)}")
+    lines.append(f"- Generated: {_now_iso()}")
     lines.append(f"- Source script: {SCRIPT_NAME} v{SCRIPT_VERSION}")
+    lines.append(f"- Tenants: {len(snapshots)}")
+    for s in snapshots:
+        valid = sum(1 for t in s.get("templates", [])
+                    if looks_like_valid_sql(t.get("sql", "")))
+        lines.append(f"  - `{s['tenant']}` (org `{s['org_id']}`): "
+                     f"{valid} valid templates from "
+                     f"{', '.join(f'`{sb}`' for sb in s.get('sandboxes', []))} "
+                     f"- snapshot {s.get('generated_at', '?')}")
     lines.append("")
 
-    for sb in sb_list:
-        lines.append(f"## Sandbox: `{sb}`")
+    for s in snapshots:
+        lines.append(f"# Tenant: {s['tenant']}")
         lines.append("")
-        for t in by_sandbox[sb]:
-            name = t.get("name", "") or "(unnamed)"
-            tid = t.get("id", "")
-            created = t.get("created", "")
-            updated = t.get("updated", "")
-            sql = (t.get("sql", "") or "").strip()
-            lines.append(f"### {name}")
-            lines.append("")
-            lines.append(f"- ID: `{tid}`")
-            lines.append(f"- Created: {created}")
-            lines.append(f"- Updated: {updated}")
-            lines.append("")
-            lines.append("```sql")
-            lines.append(sql)
-            lines.append("```")
-            lines.append("")
+        lines.append(f"- Org ID: `{s['org_id']}`")
+        lines.append(f"- Snapshot taken: {s.get('generated_at', '?')}")
+        lines.append("")
 
-    if skipped:
-        lines.append("## Skipped (does not look like SQL)")
-        lines.append("")
-        for t in skipped:
-            name = t.get("name", "") or "(unnamed)"
-            tid = t.get("id", "")
-            sb = t.get("_sandbox", "?")
-            preview = ((t.get("sql", "") or "").strip().replace("\n", " "))[:100]
-            lines.append(f"- `{sb}` - {name} (`{tid}`): {preview!r}")
-        lines.append("")
+        by_sandbox: dict[str, list[dict]] = {}
+        skipped: list[dict] = []
+        for t in s.get("templates", []):
+            if not looks_like_valid_sql(t.get("sql", "") or ""):
+                skipped.append(t)
+                continue
+            by_sandbox.setdefault(t.get("sandbox", "?"), []).append(t)
+
+        for sb in sorted(by_sandbox):
+            lines.append(f"## {s['tenant']} / `{sb}`")
+            lines.append("")
+            for t in by_sandbox[sb]:
+                name = t.get("name", "") or "(unnamed)"
+                tid = t.get("id", "")
+                created = t.get("created", "")
+                updated = t.get("updated", "")
+                sql = (t.get("sql", "") or "").strip()
+                lines.append(f"### {name}")
+                lines.append("")
+                lines.append(f"- ID: `{tid}`")
+                lines.append(f"- Created: {created}")
+                lines.append(f"- Updated: {updated}")
+                lines.append("")
+                lines.append("```sql")
+                lines.append(sql)
+                lines.append("```")
+                lines.append("")
+
+        if skipped:
+            lines.append(f"## {s['tenant']} - Skipped (does not look like SQL)")
+            lines.append("")
+            for t in skipped:
+                name = t.get("name", "") or "(unnamed)"
+                tid = t.get("id", "")
+                sb = t.get("sandbox", "?")
+                preview = ((t.get("sql", "") or "").strip().replace("\n", " "))[:100]
+                lines.append(f"- `{sb}` - {name} (`{tid}`): {preview!r}")
+            lines.append("")
 
     md_path.write_text("\n".join(lines), encoding="utf-8")
     return md_path
@@ -821,9 +870,23 @@ def main() -> None:
         path = save_template_sql(t, SQL_DIR)
         step("SAVE", f"  -> {path.relative_to(SQL_DIR.parent)}")
 
-    # 6. Combine every valid SQL into one big Markdown file for LLM use.
-    md_path = write_mega_markdown(mine, SQL_DIR)
-    step("SAVE", f"Mega file: {md_path.relative_to(SQL_DIR.parent)}")
+    # 6. Snapshot this run's full template list to sql/<tenant>/_snapshot.json,
+    #    then rebuild the cross-tenant mega file at sql/all_queries_mega_file.md
+    #    by reading every tenant's snapshot. This way one file accumulates every
+    #    org you've run against (Valtech, Admiral, etc.) instead of a per-tenant
+    #    file each time.
+    snap_path = write_tenant_snapshot(templates, SQL_DIR)
+    step("SAVE", f"Snapshot: {snap_path.relative_to(SQL_DIR.parent.parent)} "
+                  f"({len(templates)} templates from {len(sandboxes)} sandbox(es))")
+
+    sql_root = SQL_DIR.parent
+    # Clean up the previous-version per-tenant mega file if it's still there.
+    old_per_tenant = SQL_DIR / "all_queries_mega_file.md"
+    if old_per_tenant.exists():
+        old_per_tenant.unlink()
+    md_path = write_cross_tenant_mega_markdown(sql_root)
+    step("SAVE", f"Mega file (cross-tenant): "
+                  f"{md_path.relative_to(SQL_DIR.parent.parent)}")
 
 
 if __name__ == "__main__":
