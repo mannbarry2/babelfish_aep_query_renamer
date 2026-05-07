@@ -1,0 +1,18 @@
+{
+    "_comment_1":    "===== babelfish_query_renamer config =====",
+    "_organization": "<friendly org name, e.g. Valtech / Admiral>",
+    "_org_id_note":  "Adobe doesn't expose org names via API. Hard-code the org_id<->label mapping in babelfish_query_renamer.py (ORG_LABELS).",
+    "_usage":        "Copy this file to config.json and fill in your own values. Keep one config.json per Adobe org. Underscored keys are comments and ignored by the loader.",
+
+    "bearer_token": "",
+    "client_id": "<your-adobe-ims-client-id>",
+    "client_secret": "<your-adobe-ims-client-secret>",
+    "org_id": "<your-org-id>@AdobeOrg",
+    "oauth_url": "https://ims-na1.adobelogin.com/ims/token",
+    "scopes": "AdobeID,openid,read_organizations,additional_info.projectedProductContext,session",
+    "sandbox": "all",
+    "sandbox_names": ["prod"],
+    "my_user_ids": [
+        "<paste your userId once discovered via the picker>"
+    ]
+}

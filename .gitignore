@@ -1,0 +1,23 @@
+# Real config -- contains bearer_token / client_secret. Use config.example.json
+# as a starting point; copy to config.json and fill in your own values.
+config.json
+
+# Generated query exports (per-tenant SQL + the mega Markdown file).
+sql/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
