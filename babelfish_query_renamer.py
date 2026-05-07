@@ -181,14 +181,15 @@ _CACHED_TOKEN: str | None = None
 
 
 def _mask_secret(s: str, keep: int = 4) -> str:
-    """Return a masked version of a secret -- e.g. 'p8e-Yc3mHk' -> '******Hk3m'.
-    Keeps the last `keep` characters visible so you can confirm which secret
-    was loaded without exposing the whole value in logs/screenshots."""
+    """Return a short masked version of a secret -- e.g.
+    'p8e-Yc3mHk' -> '********mHk'. Always renders as 8 stars + last `keep`
+    chars + length, regardless of original length, so a 1500-char bearer
+    token doesn't produce a screen full of asterisks."""
     if not s:
         return "(empty)"
     if len(s) <= keep:
         return "*" * len(s)
-    return ("*" * (len(s) - keep)) + s[-keep:]
+    return f"********{s[-keep:]} ({len(s)} chars)"
 
 
 def fetch_oauth_token() -> str:
@@ -205,7 +206,8 @@ def fetch_oauth_token() -> str:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    step("AUTH", f"POST {OAUTH_URL} (client_credentials, client_id={CLIENT_ID})...")
+    step("AUTH", f"POST {OAUTH_URL} (client_credentials, "
+                  f"client_id={CLIENT_ID}, client_secret={_mask_secret(CLIENT_SECRET)})...")
     try:
         with urllib.request.urlopen(req) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
@@ -236,8 +238,9 @@ def get_token() -> str:
         if CLIENT_SECRET:
             _CACHED_TOKEN = fetch_oauth_token()
         elif BEARER_TOKEN:
-            step("AUTH", "No client_secret configured; using fallback "
-                          "bearer_token from config.json (may be expired).")
+            step("AUTH", f"No client_secret configured; using fallback "
+                          f"bearer_token={_mask_secret(BEARER_TOKEN)} "
+                          f"(may be expired).")
             _CACHED_TOKEN = BEARER_TOKEN
         else:
             step("ERROR", "Neither client_secret nor bearer_token is set in "
