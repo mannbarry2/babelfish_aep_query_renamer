@@ -5,6 +5,9 @@ config.json
 # Generated query exports (per-tenant SQL + the mega Markdown file).
 sql/
 
+# Downloaded failed-batch payloads from batch_fetcher_2.
+failed_batches/
+
 # Python
 __pycache__/
 *.py[cod]
