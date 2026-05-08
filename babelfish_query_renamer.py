@@ -35,18 +35,27 @@ from urllib.parse import urlencode
 # CONFIG
 # ----------------------------------------------------------------------------
 # All tunable values live in `config.json` next to this script. Required keys:
-#   bearer_token   -- pasted access token (~24h); only used as a fallback for
-#                     quick local testing. Leave "" in normal operation.
-#   client_id      -- Adobe IMS client ID
-#   client_secret  -- IMS client_credentials secret. PREFERRED -- mints a fresh
-#                     token on every run, so expiry/scope/credential changes
-#                     are picked up automatically.
-#   org_id         -- Adobe org ID (e.g. "ABC@AdobeOrg")
-#   oauth_url      -- IMS token endpoint
-#   scopes         -- IMS scopes (comma-separated)
-#   sandbox        -- "all" or a specific sandbox name
-#   sandbox_names  -- fallback list when sandbox-management API is denied
-#   my_user_ids    -- user IDs you own across orgs (Valtech, VDI, etc.)
+#   bearer_token       -- pasted access token (~24h); fallback for local
+#                         testing only. Leave "" in normal operation.
+#   client_id          -- Adobe IMS client ID
+#   client_secret      -- IMS client_credentials secret. PREFERRED -- mints a
+#                         fresh token every run.
+#   org_id             -- Adobe org ID (e.g. "ABC@AdobeOrg")
+#   oauth_url          -- IMS token endpoint
+#   scopes             -- IMS scopes (comma-separated)
+#   sandbox            -- "all" or a specific sandbox name
+#   sandbox_names      -- fallback list when sandbox-management API is denied
+#   my_user_ids        -- user IDs you own. Two formats supported:
+#                            ["abc...", "def..."]                    (legacy)
+#                            [{"id": "abc...", "label": "Valtech"}]  (preferred)
+# Optional keys (Claude-API naming, added in v0.5):
+#   anthropic_api_key  -- Anthropic API key. If set, Claude is used to suggest
+#                         names from the SQL itself. Empty = skip, fall through
+#                         to local heuristic.
+#   anthropic_model    -- Claude model ID. Defaults to "claude-opus-4-7".
+#   naming_config      -- Optional dict shaping Claude's output:
+#                            {"style": "kebab-case", "max_length": 60,
+#                             "instructions": "<extra rules>"}
 # client_secret wins over bearer_token when both are set.
 # ============================================================================
 
@@ -77,16 +86,35 @@ def _load_config() -> dict:
     return cfg
 
 
-_CFG          = _load_config()
-BEARER_TOKEN  = _CFG.get("bearer_token", "")
-CLIENT_ID     = _CFG["client_id"]
-CLIENT_SECRET = _CFG.get("client_secret", "")
-ORG_ID        = _CFG["org_id"]
-OAUTH_URL     = _CFG["oauth_url"]
-SCOPES        = _CFG["scopes"]
-SANDBOX       = _CFG["sandbox"]
-SANDBOX_NAMES = list(_CFG["sandbox_names"])
-MY_USER_IDS   = list(_CFG["my_user_ids"])
+def _normalize_user_ids(raw: list) -> list[dict]:
+    """Accept either ['abc', 'def'] (legacy) or [{'id': 'abc', 'label': '...'}]
+    (preferred). Returns a uniform list of dicts so the rest of the code can
+    rely on `entry['id']` / `entry['label']`."""
+    out: list[dict] = []
+    for entry in raw or []:
+        if isinstance(entry, str):
+            out.append({"id": entry, "label": ""})
+        elif isinstance(entry, dict) and entry.get("id"):
+            out.append({"id": entry["id"], "label": (entry.get("label") or "").strip()})
+    return out
+
+
+_CFG               = _load_config()
+BEARER_TOKEN       = _CFG.get("bearer_token", "")
+CLIENT_ID          = _CFG["client_id"]
+CLIENT_SECRET      = _CFG.get("client_secret", "")
+ORG_ID             = _CFG["org_id"]
+OAUTH_URL          = _CFG["oauth_url"]
+SCOPES             = _CFG["scopes"]
+SANDBOX            = _CFG["sandbox"]
+SANDBOX_NAMES      = list(_CFG["sandbox_names"])
+MY_USER_IDS        = _normalize_user_ids(_CFG["my_user_ids"])
+_LABELS_BY_ID      = {e["id"]: e["label"] for e in MY_USER_IDS}
+
+# Optional Claude-API naming integration.
+ANTHROPIC_API_KEY  = (_CFG.get("anthropic_api_key") or "").strip()
+ANTHROPIC_MODEL    = _CFG.get("anthropic_model") or "claude-opus-4-7"
+NAMING_CONFIG      = _CFG.get("naming_config") or {}
 
 # ============================================================================
 
@@ -148,6 +176,7 @@ _TAG_COLORS = {
     "PICK":   "\033[33m",    # yellow
     "SAVE":   "\033[92m",    # bright green
     "RENAME": "\033[93m",    # bright yellow
+    "SKIP":   "\033[90m",    # grey -- non-fatal "you don't have access here" notes
     "ERROR":  "\033[1;31m",  # bold red
     "HINT":   "\033[33m",    # yellow
 }
@@ -190,6 +219,35 @@ def _mask_secret(s: str, keep: int = 4) -> str:
     if len(s) <= keep:
         return "*" * len(s)
     return f"********{s[-keep:]} ({len(s)} chars)"
+
+
+def _display_owner(uid: str) -> str:
+    """Pretty display for a userId.
+
+    When labelled in my_user_ids, return JUST the label -- the underlying
+    hex adds nothing readable. The mapping is dumped once at startup
+    (print_user_id_map) so you can still see what maps to what.
+
+    When unlabelled, return the full userId so you can still recognise it
+    by activity context and add it to my_user_ids in config.json."""
+    if not uid:
+        return "(no userId)"
+    label = _LABELS_BY_ID.get(uid, "")
+    if label:
+        return label
+    return uid
+
+
+def print_user_id_map() -> None:
+    """One-time printout near startup: which labels in config.json map to
+    which userIds. So after this, the rest of the run can use just the label
+    everywhere without losing the audit trail."""
+    if not MY_USER_IDS:
+        return
+    step("AUTH", "userId labels (from config.json my_user_ids):")
+    for entry in MY_USER_IDS:
+        label = entry.get("label") or "(no label)"
+        step("AUTH", f"  {label}  =  {entry['id']}")
 
 
 def fetch_oauth_token() -> str:
@@ -273,6 +331,12 @@ def list_sandboxes() -> list[str]:
     headers = auth_headers(sandbox="")
     headers.pop("x-sandbox-name", None)
     status, text = http_request("GET", SANDBOX_URL, headers)
+    if status == 403:
+        step("SKIP", "Sandbox-management API denied (403) -- token lacks the "
+                      "management read scope. Falling back to sandbox_names "
+                      "from config.json. This is expected on minimally-scoped "
+                      "Query Service tokens.")
+        return []
     if status < 200 or status >= 300:
         step("ERROR", f"Sandbox list failed: HTTP {status} {text[:200]}")
         return []
@@ -409,6 +473,144 @@ def suggest_from_sql(sql: str) -> str:
         description = first_word
 
     return f"{dataset} - {description}"
+
+
+def _detect_description(sql: str) -> str | None:
+    """Look for an explicit name/description in the leading SQL comments.
+
+    Recognises:
+        -- name: <text>
+        -- description: <text>
+        /* name: <text> */ or /* description: <text> */ at the very top
+    Returns the value if found, None otherwise. The script's own header
+    (-- Template ID :, -- Sandbox :, etc.) is ignored -- we look only for
+    name/description-prefixed comments."""
+    if not sql or not sql.strip():
+        return None
+    for line in sql.splitlines()[:20]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        m = re.match(
+            r"^\s*--\s*(?:name|description)\s*[:=]\s*(.+?)\s*$",
+            line,
+            re.IGNORECASE,
+        )
+        if m:
+            return m.group(1).strip()
+        if not stripped.startswith("--"):
+            break
+    m = re.match(
+        r"^\s*/\*\s*(?:name|description)\s*[:=]\s*([^*]+?)\s*\*/",
+        sql,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        return m.group(1).strip().splitlines()[0].strip()
+    return None
+
+
+_CLAUDE_CACHE: dict[str, str] = {}
+
+
+def _claude_suggest_name(sql: str) -> str | None:
+    """Call Claude's Messages API to suggest a name from the SQL. Returns the
+    name on success, None on any failure (no API key, network error, empty
+    response). Cached per-SQL for the lifetime of the run.
+
+    Uses stdlib urllib so the script keeps its no-pip-install promise.
+    Marks the system prompt as cacheable on the Anthropic side -- a no-op for
+    short prompts (4096-token min on Opus 4.7) but ready when naming_config
+    grows into a longer rules document."""
+    if not ANTHROPIC_API_KEY:
+        return None
+    cache_key = sql.strip()
+    if cache_key in _CLAUDE_CACHE:
+        return _CLAUDE_CACHE[cache_key]
+
+    style       = NAMING_CONFIG.get("style") or "kebab-case"
+    max_length  = NAMING_CONFIG.get("max_length") or 60
+    rules       = (NAMING_CONFIG.get("instructions") or "").strip()
+
+    system_text = (
+        "You suggest concise, descriptive names for AEP Query Service templates "
+        f"based on their SQL. Return ONLY the name -- no quotes, no explanation, "
+        f"no markdown, no trailing punctuation. Use {style}. "
+        f"Maximum {max_length} characters."
+    )
+    if rules:
+        system_text += f"\n\nAdditional rules:\n{rules}"
+
+    body = json.dumps({
+        "model":      ANTHROPIC_MODEL,
+        "max_tokens": 64,
+        "system":     [{
+            "type": "text",
+            "text": system_text,
+            "cache_control": {"type": "ephemeral"},
+        }],
+        "messages": [{
+            "role": "user",
+            "content": f"SQL:\n\n{sql.strip()[:2000]}",
+        }],
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers={
+            "x-api-key":          ANTHROPIC_API_KEY,
+            "anthropic-version":  "2023-06-01",
+            "Content-Type":       "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        text = e.read().decode("utf-8", errors="replace")[:200]
+        step("ERROR", f"Claude API HTTP {e.code}: {text}")
+        return None
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        step("ERROR", f"Claude API call failed: {e}")
+        return None
+
+    for block in payload.get("content", []):
+        if block.get("type") == "text":
+            name = (block.get("text") or "").strip().strip('"').strip("'")
+            if name:
+                _CLAUDE_CACHE[cache_key] = name
+                return name
+    return None
+
+
+def suggest_name_with_source(sql: str) -> tuple[str, str]:
+    """Pick the best name suggestion plus a label for the source. Returns
+    (suggestion, source) where source is 'description', 'AI', or 'heuristic'.
+
+    AI-generated names are tagged with naming_config.ai_suffix (default
+    ' [babelfish]') so that, looking at AEP's Templates panel later, you can
+    spot which queries got renamed by Claude vs. by hand. The marker is at
+    the END so the readable name still sorts naturally in the UI. Set
+    ai_suffix to '' in config.json to disable.
+
+    Order:
+      1. Explicit description in SQL (-- name:/-- description:/...).
+      2. Claude API (if ANTHROPIC_API_KEY is configured).
+      3. Local heuristic from suggest_from_sql -- always works."""
+    desc = _detect_description(sql)
+    if desc:
+        return desc, "description"
+    ai = _claude_suggest_name(sql)
+    if ai:
+        suffix = NAMING_CONFIG.get("ai_suffix", " [babelfish]")
+        # Don't double-tag if Claude already included the suffix or if the
+        # SQL was previously auto-named on a prior run.
+        if suffix and not ai.rstrip().endswith(suffix.strip()):
+            ai = f"{ai}{suffix}"
+        return ai, "AI"
+    return suggest_from_sql(sql), "heuristic"
 
 
 def sanitize_filename(name: str) -> str:
@@ -591,47 +793,97 @@ def rename_template(template_id: str, new_name: str, sql: str, sandbox: str) -> 
     return True
 
 
-def pick_user_id(templates: list[dict]) -> str | None:
-    """Show a numbered menu of userIds present in the response.
-    Returns the chosen userId, or None if the user picks 'a' (all).
-    """
+def pick_user_ids(templates: list[dict]) -> list[str]:
+    """Multi-select picker. Shows the userIds present in `templates` along
+    with any label from MY_USER_IDS, plus a date range and sample template
+    names for each user so you can recognise your own activity (Adobe
+    doesn't expose an API to resolve IMS IDs to emails on this auth setup).
+    Accepts comma- or space-separated indices (e.g. '1,3' or '1 3'), or
+    'a' for no filter. Returns the list of chosen userIds (empty list = no
+    filter)."""
     from collections import Counter
     counts = Counter(t.get("userId", "") for t in templates if t.get("userId"))
     if not counts:
         step("PICK", "No userIds in the response; using no filter.")
-        return None
+        return []
+
+    # Build per-user enrichment: date range + a couple of sample template names.
+    per_user: dict[str, dict] = {}
+    for t in templates:
+        uid = t.get("userId", "")
+        if not uid:
+            continue
+        info = per_user.setdefault(uid, {"dates": [], "names": []})
+        c = (t.get("created") or "")[:10]
+        if c:
+            info["dates"].append(c)
+        nm = t.get("name") or ""
+        if nm:
+            info["names"].append(nm)
 
     items = counts.most_common()
     print()
-    step("PICK", "Choose a userId to filter by:")
+    step("PICK", "Choose userId(s) to filter by (you can pick more than one):")
+    step("PICK", "Adobe doesn't expose an API to resolve these IDs to emails "
+                 "on this auth setup, so use the date range + sample names "
+                 "below to recognise your own activity.")
     for i, (uid, n) in enumerate(items, 1):
-        print(f"  [{i:>2}] {n:>5} templates    {uid}")
-    print( "  [ a]               (no filter -- show every template)")
+        label = _LABELS_BY_ID.get(uid, "")
+        label_str = f"  -- {label}" if label else ""
+        print(f"  [{i:>2}] {n:>5} templates    {uid}{label_str}")
+        info = per_user.get(uid, {})
+        dates = info.get("dates") or []
+        names = info.get("names") or []
+        if dates:
+            date_range = (
+                f"{min(dates)}..{max(dates)}" if min(dates) != max(dates)
+                else f"on {min(dates)}"
+            )
+        else:
+            date_range = "no dates"
+        sample = " | ".join(n[:40] for n in names[:3])
+        print(f"            activity {date_range}")
+        if sample:
+            print(f"            recent names: {sample}")
+    print( "  [ a]                  (no filter -- show every template)")
     print()
     while True:
         try:
-            raw = input("  Pick a number (or 'a'): ")
+            raw = input("  Pick number(s) (e.g. '1' or '1,3' or 'a'): ")
         except EOFError:
             step("ERROR", "stdin closed; cannot pick. Set my_user_ids in config.json.")
             sys.exit(1)
         choice = raw.replace(chr(0xfeff), "").strip().lower()
         if choice == "a":
-            return None
+            return []
         try:
-            n = int(choice)
-            if 1 <= n <= len(items):
-                picked = items[n - 1][0]
-                step("PICK", f"Selected: {picked}")
-                step("PICK", "Tip: add this to my_user_ids in config.json "
-                            "to skip this menu next time.")
-                return picked
+            nums = [int(x) for x in re.split(r"[,\s]+", choice) if x]
+            if not nums or not all(1 <= n <= len(items) for n in nums):
+                raise ValueError
+            picked_uids = [items[n - 1][0] for n in nums]
+            picked_uids = list(dict.fromkeys(picked_uids))  # de-dupe, preserve order
+            step("PICK", f"Selected {len(picked_uids)} userId(s):")
+            for uid in picked_uids:
+                step("PICK", f"  - {_display_owner(uid)}")
+            step("PICK", "Tip: add these (with labels) to my_user_ids in "
+                         "config.json to skip this menu next time.")
+            return picked_uids
         except ValueError:
             pass
         print(f"  Invalid choice '{choice}'. Try again.")
 
 
+_NO_ACCESS_SANDBOXES: list[str] = []  # populated by fetch_templates_in_sandbox
+
+
 def fetch_templates_in_sandbox(sandbox: str) -> list[dict]:
-    """Fetch all templates from a single sandbox, tagging each with `_sandbox`."""
+    """Fetch all templates from a single sandbox, tagging each with `_sandbox`.
+
+    A 403 from this endpoint means the token authenticated fine but the user
+    lacks Query Service permission in *this specific sandbox*. That's not an
+    error condition for the run -- it's expected on tokens scoped to one or
+    two sandboxes per org. Log it as [SKIP] and move on; we'll show a summary
+    at the end."""
     step("FETCH", f"Sandbox '{sandbox}': listing templates...")
     headers = auth_headers(sandbox=sandbox)
     out: list[dict] = []
@@ -646,6 +898,11 @@ def fetch_templates_in_sandbox(sandbox: str) -> list[dict]:
         if status == 401:
             step("ERROR", "401 Unauthorized - token expired/invalid.")
             sys.exit(1)
+        if status == 403:
+            step("SKIP", f"  no Query Service access in sandbox '{sandbox}' "
+                          f"(token lacks the right scope/role here).")
+            _NO_ACCESS_SANDBOXES.append(sandbox)
+            return []
         if status < 200 or status >= 300:
             step("ERROR", f"  page {page}: HTTP {status} {text[:200]}")
             break
@@ -697,71 +954,152 @@ def prepare_folder_structure(sandboxes: list[str]) -> None:
 
 def fetch_all_templates(sandboxes: list[str]) -> list[dict]:
     """Fetch templates from each of the given sandboxes."""
+    _NO_ACCESS_SANDBOXES.clear()
     all_templates: list[dict] = []
     for sb in sandboxes:
         all_templates.extend(fetch_templates_in_sandbox(sb))
-    step("FETCH", f"Done - {len(all_templates)} templates across {len(sandboxes)} sandbox(es).")
+    accessed = len(sandboxes) - len(_NO_ACCESS_SANDBOXES)
+    summary = (f"Done - {len(all_templates)} templates from {accessed} of "
+               f"{len(sandboxes)} sandbox(es)")
+    if _NO_ACCESS_SANDBOXES:
+        summary += (f"; no Query Service access in: "
+                    f"{', '.join(_NO_ACCESS_SANDBOXES)}")
+    step("FETCH", summary + ".")
     return all_templates
 
 
-def confirm_user_id(templates: list[dict]) -> str | None:
-    """Always prompt to confirm which user's templates to filter by.
+def confirm_user_ids(templates: list[dict]) -> list[str]:
+    """Always prompt to confirm which user(s) to filter by. Returns a list of
+    userIds (empty = no filter).
 
-    If exactly one entry from MY_USER_IDS appears in the response, suggest it
-    (Enter to accept). Otherwise fall through to the full numbered picker.
-    Returns the chosen userId, or None for 'no filter'.
-    """
+    If any MY_USER_IDS entries appear in the response, pre-select all of them
+    and ask for confirmation -- this handles cases like 'I have an old
+    decommissioned account AND a current one in the same org'. 'p' drops to
+    the multi-select picker. 'a' = no filter."""
     from collections import Counter
     counts = Counter(t.get("userId", "") for t in templates if t.get("userId"))
     if not counts:
         step("PICK", "No userIds in the response; no filter applied.")
+        return []
+
+    matching_ids = [e["id"] for e in MY_USER_IDS if e["id"] in counts]
+
+    if not matching_ids:
+        step("PICK", "None of my_user_ids appear in this response (likely a "
+                     "different tenant). Showing every userId found -- pick "
+                     "yours, then add them to my_user_ids in config.json.")
+        return pick_user_ids(templates)
+
+    # Per-sandbox breakdown across ALL matching IDs -- shows the combined total
+    # and what's coming from where, so a number like "62" isn't a mystery.
+    per_sb: dict[str, int] = {}
+    matching_set = set(matching_ids)
+    for t in templates:
+        if t.get("userId") in matching_set:
+            sb = t.get("_sandbox", "?")
+            per_sb[sb] = per_sb.get(sb, 0) + 1
+    total = sum(per_sb.values())
+
+    print()
+    step("PICK", f"Found {len(matching_ids)} of your known userId(s) in this response:")
+    for uid in matching_ids:
+        step("PICK", f"  - {_display_owner(uid)}  ({counts[uid]} templates)")
+
+    sb_w = max((len(s) for s in per_sb), default=14)
+    print(f"        {'SANDBOX':<{sb_w}}  COUNT")
+    print(f"        {'-' * sb_w}  -----")
+    for sb in sorted(per_sb):
+        print(f"        {sb:<{sb_w}}  {per_sb[sb]:>5}")
+    print(f"        {'TOTAL':<{sb_w}}  {total:>5}")
+
+    try:
+        raw = input("  Enter=use all of these, 'p'=pick from full list, 'a'=no filter: ")
+    except EOFError:
+        step("ERROR", "stdin closed; cannot confirm. Set my_user_ids in config.json.")
+        sys.exit(1)
+    choice = raw.replace(chr(0xfeff), "").strip().lower()
+    if choice == "":
+        return matching_ids
+    if choice == "a":
+        return []
+    return pick_user_ids(templates)
+
+
+def ask_sandbox_filter(mine: list[dict]) -> set[str] | None:
+    """Ask which sandbox to focus the rename loop on. Returns a set of
+    sandbox names (always one entry), or None for 'all'. Skipped silently
+    when the user only has templates in a single sandbox -- nothing to pick."""
+    from collections import Counter
+    counts = Counter(t.get("_sandbox", "?") for t in mine)
+    if len(counts) <= 1:
         return None
-
-    matching = [uid for uid in MY_USER_IDS if uid in counts]
-
-    if len(matching) == 1:
-        suggested = matching[0]
-        n = counts[suggested]
-        # Per-sandbox breakdown for the suggested user, so totals like "6"
-        # don't surprise you when they span multiple sandboxes.
-        per_sb: dict[str, int] = {}
-        for t in templates:
-            if t.get("userId") == suggested:
-                sb = t.get("_sandbox", "?")
-                per_sb[sb] = per_sb.get(sb, 0) + 1
-        print()
-        step("PICK", f"Suggestion: {suggested}")
-        sb_w = max((len(s) for s in per_sb), default=8)
-        print(f"        {'SANDBOX':<{sb_w}}  COUNT")
-        print(f"        {'-' * sb_w}  -----")
-        for sb in sorted(per_sb):
-            print(f"        {sb:<{sb_w}}  {per_sb[sb]:>5}")
-        print(f"        {'TOTAL':<{sb_w}}  {n:>5}")
+    items = sorted(counts.items(), key=lambda kv: -kv[1])
+    print()
+    step("PICK", "Which sandbox to rename in?")
+    for i, (sb, n) in enumerate(items, 1):
+        print(f"  [{i:>2}] {sb} ({n} of your templates)")
+    print( "  [ a]  all sandboxes")
+    print()
+    while True:
         try:
-            raw = input("  Enter=confirm this is you, 'p'=pick a different one, 'a'=no filter: ")
+            raw = input("  Pick a number or 'a' (default 'a'): ").strip().lower()
         except EOFError:
-            step("ERROR", "stdin closed; cannot confirm. Set my_user_ids in config.json.")
-            sys.exit(1)
-        choice = raw.replace(chr(0xfeff), "").strip().lower()
-        if choice == "":
-            return suggested
-        if choice == "a":
             return None
-        # 'p' (or anything else) falls through to the picker.
-    elif len(matching) > 1:
-        step("PICK", f"Multiple MY_USER_IDS appear in the response: {matching}. "
-                     "Choose one from the full list below.")
-    else:
-        step("PICK", "None of MY_USER_IDS appear in this response (likely a "
-                     "different tenant). Showing every userId found - pick "
-                     "yours, then add it to MY_USER_IDS for next time.")
+        if raw in ("", "a"):
+            return None
+        try:
+            n = int(raw)
+            if 1 <= n <= len(items):
+                return {items[n - 1][0]}
+        except ValueError:
+            pass
+        print(f"  Invalid choice '{raw}'. Try again.")
 
-    return pick_user_id(templates)
+
+def ask_rename_mode(mine: list[dict]) -> bool:
+    """Ask interactive vs batch. Returns True for batch (auto-accept the
+    AI/heuristic suggestion for every template without prompting). Before
+    confirming batch, shows a per-owner breakdown so you can spot any
+    templates you don't actually own (e.g. a system account picked by
+    mistake) and abort."""
+    from collections import Counter
+    count = len(mine)
+    print()
+    step("PICK", f"Rename mode for {count} template(s):")
+    print( "  [enter]  interactive  - review each suggestion individually")
+    print( "  [batch]  batch        - auto-accept every suggestion without asking")
+    print()
+    try:
+        raw = input("  Mode (default interactive): ").strip().lower()
+    except EOFError:
+        return False
+    if raw in ("batch", "b"):
+        owners = Counter(t.get("userId") or "(no userId)" for t in mine)
+        print()
+        step("PICK", f"BATCH MODE will rename these {count} template(s):")
+        for uid, n in owners.most_common():
+            label = _LABELS_BY_ID.get(uid)
+            owner_disp = (
+                _display_owner(uid) if label
+                else f"{uid}   [unlabeled -- check this is you!]"
+            )
+            print(f"    {n:>3} owned by  {owner_disp}")
+        print()
+        try:
+            confirm = input("  Proceed with batch rename? (y/N): ").strip().lower()
+        except EOFError:
+            return False
+        if confirm in ("y", "yes"):
+            step("PICK", "Batch mode confirmed -- auto-accepting every suggestion.")
+            return True
+        step("PICK", "Cancelled batch mode; falling back to interactive.")
+    return False
 
 
 def main() -> None:
     print_banner()
     step("START", f"{SCRIPT_NAME} starting.")
+    print_user_id_map()
 
     # 1. Resolve sandboxes and lay out sql/<sandbox>/ folders BEFORE fetching,
     #    so the structure is visible (and any listing failure stops us early).
@@ -772,14 +1110,32 @@ def main() -> None:
     templates = fetch_all_templates(sandboxes)
 
     # 3. Confirm whose templates to act on (always asks for confirmation).
-    my_user_id = confirm_user_id(templates)
-    if my_user_id:
-        step("FILTER", f"userId == {my_user_id}")
-        mine = [t for t in templates if t.get("userId") == my_user_id]
+    selected_ids = confirm_user_ids(templates)
+    if selected_ids:
+        selected_set = set(selected_ids)
+        mine = [t for t in templates if t.get("userId") in selected_set]
+        step("FILTER", f"User filter: {len(selected_set)} ID(s) selected -> "
+                        f"{len(mine)} template(s) of {len(templates)} in this tenant.")
     else:
-        step("FILTER", "userId filter: OFF (every template).")
         mine = list(templates)
-    step("FILTER", f"{len(mine)} of {len(templates)} match.")
+        step("FILTER", f"NO USER FILTER -- including every template "
+                        f"({len(templates)} total, regardless of owner).")
+
+    # 3b. Optionally narrow to a single sandbox (skipped when only one sandbox
+    #     is in the picture anyway, or when stdin isn't a TTY).
+    interactive = sys.stdin.isatty()
+    if interactive and mine:
+        chosen_sbs = ask_sandbox_filter(mine)
+        if chosen_sbs is not None:
+            before = len(mine)
+            mine = [t for t in mine if t.get("_sandbox") in chosen_sbs]
+            step("FILTER", f"Sandbox filter: {sorted(chosen_sbs)} -> "
+                            f"{len(mine)} template(s) of {before} remaining.")
+
+    # 3c. Interactive vs batch mode for the rename loop.
+    auto_accept = False
+    if interactive and mine:
+        auto_accept = ask_rename_mode(mine)
 
     # 4. Print the summary table.
     rows = []
@@ -803,13 +1159,15 @@ def main() -> None:
     if not mine:
         return
 
-    # 5. For each template: prompt for rename (if interactive), then save the
-    #    .sql to disk. Save happens AFTER any rename so the filename reflects
-    #    the new name; templates you skip still get saved with their old name.
-    interactive = sys.stdin.isatty()
-    if interactive:
-        step("RENAME", "Rename mode. Per template: Enter=accept suggestion, "
-                       "type a new name, or 's'=skip rename (still saved).")
+    # 5. For each template: pick a name (interactively or via batch auto-accept),
+    #    apply it, save the .sql to disk. Save happens AFTER any rename so the
+    #    filename reflects the new name; skipped templates still get saved with
+    #    their old name.
+    if auto_accept:
+        step("RENAME", f"Batch mode: auto-accepting suggestions for {len(mine)} template(s).")
+    elif interactive:
+        step("RENAME", "Interactive: Enter=accept suggestion, type a new name, "
+                       "or 's'=skip rename (still saved).")
     else:
         step("RENAME", "stdin is not a TTY; saving with current names without renaming.")
 
@@ -832,13 +1190,23 @@ def main() -> None:
         old     = t.get("name", "") or "(unnamed)"
         sql     = t.get("sql", "") or ""
         sandbox = t.get("_sandbox", "")
+        owner   = t.get("userId", "") or "(no userId)"
+        owner_disp = _display_owner(owner)
 
-        if interactive:
-            suggest = suggest_from_sql(sql)
+        new_name: str | None = None
+        if auto_accept:
+            suggest, source = suggest_name_with_source(sql)
+            new_name = suggest
+            step("RENAME", f"[batch] {sandbox} | owner {owner_disp} | "
+                            f"{old!r} -> {suggest!r} (source: {source})")
+        elif interactive:
+            suggest, source = suggest_name_with_source(sql)
             print()
+            print(f"  Owner       : {owner_disp}")
             print(f"  Sandbox     : {sandbox}")
             print(f"  Current name: {old}")
             print(f"  Suggestion  : {suggest}")
+            print(f"  Source      : {source}")
             print(f"  SQL preview : {sql.strip()[:120]}")
             try:
                 raw = input("  New name (Enter=accept, 's'=skip rename): ")
@@ -851,21 +1219,23 @@ def main() -> None:
                 step("RENAME", "Skipped rename.")
             else:
                 new_name = answer if answer else suggest
-                new_norm = _norm(new_name)
-                old_norm = _norm(old)
-                existing = existing_by_sandbox.get(sandbox, set())
-                if new_norm == old_norm:
-                    step("RENAME", f"Name unchanged ('{old}'); no PUT needed.")
-                elif new_norm in existing:
-                    step("RENAME", f"Skip PUT - '{new_name}' already exists in "
-                                   f"sandbox '{sandbox}' on a different template.")
-                else:
-                    step("RENAME", f"PUT '{old}' -> '{new_name}'")
-                    if rename_template(tid, new_name, sql, sandbox):
-                        t["name"] = new_name  # save below uses the new name
-                        existing.discard(old_norm)
-                        existing.add(new_norm)
-                        existing_by_sandbox[sandbox] = existing
+
+        if new_name is not None:
+            new_norm = _norm(new_name)
+            old_norm = _norm(old)
+            existing = existing_by_sandbox.get(sandbox, set())
+            if new_norm == old_norm:
+                step("RENAME", f"Name unchanged ('{old}'); no PUT needed.")
+            elif new_norm in existing:
+                step("RENAME", f"Skip PUT - '{new_name}' already exists in "
+                               f"sandbox '{sandbox}' on a different template.")
+            else:
+                step("RENAME", f"PUT '{old}' -> '{new_name}'")
+                if rename_template(tid, new_name, sql, sandbox):
+                    t["name"] = new_name  # save below uses the new name
+                    existing.discard(old_norm)
+                    existing.add(new_norm)
+                    existing_by_sandbox[sandbox] = existing
 
         path = save_template_sql(t, SQL_DIR)
         step("SAVE", f"  -> {path.relative_to(SQL_DIR.parent)}")

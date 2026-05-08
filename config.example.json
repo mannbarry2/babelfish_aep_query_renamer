@@ -13,6 +13,19 @@
     "sandbox": "all",
     "sandbox_names": ["prod"],
     "my_user_ids": [
-        "<paste your userId once discovered via the picker>"
-    ]
+        {
+            "id": "<paste your userId once discovered via the picker>",
+            "label": "<friendly label, e.g. Valtech primary>"
+        }
+    ],
+
+    "_anthropic_note": "Optional. If anthropic_api_key is set, Claude is used to suggest names from the SQL itself. Leave empty to fall back to the local heuristic.",
+    "anthropic_api_key": "",
+    "anthropic_model": "claude-opus-4-7",
+    "naming_config": {
+        "style": "kebab-case",
+        "max_length": 60,
+        "instructions": "<optional extra naming rules, e.g. 'Always include the primary dataset name. Prefer noun-verb format like users-count or events-by-day.'>",
+        "ai_suffix": " [babelfish]"
+    }
 }
