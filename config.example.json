@@ -26,6 +26,7 @@
         "style": "kebab-case",
         "max_length": 60,
         "instructions": "<optional extra naming rules, e.g. 'Always include the primary dataset name. Prefer noun-verb format like users-count or events-by-day.'>",
-        "ai_suffix": " [babelfish]"
+        "ai_suffix": " [babelfish]",
+        "ai_foreign_suffix": " [babelfish system]"
     }
 }

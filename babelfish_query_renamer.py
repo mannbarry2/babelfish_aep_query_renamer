@@ -238,6 +238,16 @@ def _display_owner(uid: str) -> str:
     return uid
 
 
+def _is_foreign(uid: str) -> bool:
+    """A template is 'foreign' if its owner isn't one of your labelled IDs
+    in my_user_ids -- could be a system account (aep_insights_enablement,
+    sample_data, etc.), a colleague's, or just an unidentified user.
+
+    Used to add extra friction before renaming and to tag the new name with
+    a 'system' suffix so foreign-owned templates stand out in AEP later."""
+    return bool(uid) and uid not in _LABELS_BY_ID
+
+
 def print_user_id_map() -> None:
     """One-time printout near startup: which labels in config.json map to
     which userIds. So after this, the rest of the run can use just the label
@@ -585,15 +595,18 @@ def _claude_suggest_name(sql: str) -> str | None:
     return None
 
 
-def suggest_name_with_source(sql: str) -> tuple[str, str]:
+def suggest_name_with_source(sql: str, owner: str = "") -> tuple[str, str]:
     """Pick the best name suggestion plus a label for the source. Returns
     (suggestion, source) where source is 'description', 'AI', or 'heuristic'.
 
-    AI-generated names are tagged with naming_config.ai_suffix (default
-    ' [babelfish]') so that, looking at AEP's Templates panel later, you can
-    spot which queries got renamed by Claude vs. by hand. The marker is at
-    the END so the readable name still sorts naturally in the UI. Set
-    ai_suffix to '' in config.json to disable.
+    AI-generated names are tagged with a suffix so they stand out in AEP's
+    Templates panel later. Two suffixes:
+      - naming_config.ai_suffix (default ' [babelfish]') for templates owned
+        by your labelled user IDs.
+      - naming_config.ai_foreign_suffix (default ' [babelfish system]') for
+        templates owned by anyone else (system accounts, colleagues, etc.).
+        This makes it visible in the UI that you renamed a foreign-owned
+        table.
 
     Order:
       1. Explicit description in SQL (-- name:/-- description:/...).
@@ -604,7 +617,10 @@ def suggest_name_with_source(sql: str) -> tuple[str, str]:
         return desc, "description"
     ai = _claude_suggest_name(sql)
     if ai:
-        suffix = NAMING_CONFIG.get("ai_suffix", " [babelfish]")
+        if owner and _is_foreign(owner):
+            suffix = NAMING_CONFIG.get("ai_foreign_suffix", " [babelfish system]")
+        else:
+            suffix = NAMING_CONFIG.get("ai_suffix", " [babelfish]")
         # Don't double-tag if Claude already included the suffix or if the
         # SQL was previously auto-named on a prior run.
         if suffix and not ai.rstrip().endswith(suffix.strip()):
@@ -1028,7 +1044,12 @@ def confirm_user_ids(templates: list[dict]) -> list[str]:
 def ask_sandbox_filter(mine: list[dict]) -> set[str] | None:
     """Ask which sandbox to focus the rename loop on. Returns a set of
     sandbox names (always one entry), or None for 'all'. Skipped silently
-    when the user only has templates in a single sandbox -- nothing to pick."""
+    when only one sandbox is in scope -- nothing to pick.
+
+    When `mine` includes foreign-owned templates (because 'a' = no user
+    filter was selected, or you picked an unlabelled user from the picker),
+    the per-sandbox count splits into 'yours / foreign' so you can see
+    exactly what's about to be renamed in each sandbox."""
     from collections import Counter
     counts = Counter(t.get("_sandbox", "?") for t in mine)
     if len(counts) <= 1:
@@ -1036,8 +1057,17 @@ def ask_sandbox_filter(mine: list[dict]) -> set[str] | None:
     items = sorted(counts.items(), key=lambda kv: -kv[1])
     print()
     step("PICK", "Which sandbox to rename in?")
-    for i, (sb, n) in enumerate(items, 1):
-        print(f"  [{i:>2}] {sb} ({n} of your templates)")
+    for i, (sb, total) in enumerate(items, 1):
+        sb_templates = [t for t in mine if t.get("_sandbox") == sb]
+        yours = sum(1 for t in sb_templates if not _is_foreign(t.get("userId", "")))
+        foreign = total - yours
+        if foreign and yours:
+            descr = f"{total} total -- {yours} yours, {foreign} FOREIGN"
+        elif foreign:
+            descr = f"{foreign} FOREIGN (none of your labelled user IDs)"
+        else:
+            descr = f"{yours} of your templates"
+        print(f"  [{i:>2}] {sb} ({descr})")
     print( "  [ a]  all sandboxes")
     print()
     while True:
@@ -1056,12 +1086,17 @@ def ask_sandbox_filter(mine: list[dict]) -> set[str] | None:
         print(f"  Invalid choice '{raw}'. Try again.")
 
 
-def ask_rename_mode(mine: list[dict]) -> bool:
-    """Ask interactive vs batch. Returns True for batch (auto-accept the
-    AI/heuristic suggestion for every template without prompting). Before
-    confirming batch, shows a per-owner breakdown so you can spot any
-    templates you don't actually own (e.g. a system account picked by
-    mistake) and abort."""
+def ask_rename_mode(mine: list[dict]) -> tuple[bool, bool]:
+    """Ask interactive vs batch. Returns (auto_accept, exclude_foreign).
+
+    auto_accept=True means apply the suggestion to every template without
+    per-template prompting.
+
+    exclude_foreign=True means drop templates owned by users not in
+    my_user_ids before processing. Renaming foreign-owned templates is
+    risky -- they could be system tables (e.g. aep_insights_enablement) or
+    a colleague's. Batch mode requires typing 'YES' (uppercase, exact) to
+    include them; anything else excludes."""
     from collections import Counter
     count = len(mine)
     print()
@@ -1072,28 +1107,51 @@ def ask_rename_mode(mine: list[dict]) -> bool:
     try:
         raw = input("  Mode (default interactive): ").strip().lower()
     except EOFError:
-        return False
-    if raw in ("batch", "b"):
-        owners = Counter(t.get("userId") or "(no userId)" for t in mine)
-        print()
-        step("PICK", f"BATCH MODE will rename these {count} template(s):")
-        for uid, n in owners.most_common():
-            label = _LABELS_BY_ID.get(uid)
-            owner_disp = (
-                _display_owner(uid) if label
-                else f"{uid}   [unlabeled -- check this is you!]"
-            )
-            print(f"    {n:>3} owned by  {owner_disp}")
-        print()
+        return False, False
+    if raw not in ("batch", "b"):
+        return False, False
+
+    owners = Counter(t.get("userId") or "(no userId)" for t in mine)
+    foreign_count = sum(n for uid, n in owners.items() if _is_foreign(uid))
+
+    print()
+    step("PICK", f"BATCH MODE will rename these {count} template(s):")
+    for uid, n in owners.most_common():
+        owner_disp = _display_owner(uid)
+        flag = "   [!] FOREIGN -- not in your my_user_ids" if _is_foreign(uid) else ""
+        print(f"    {n:>3} owned by  {owner_disp}{flag}")
+    print()
+
+    exclude_foreign = False
+    if foreign_count > 0:
+        step("PICK", f"WARNING: {foreign_count} of these are NOT owned by your "
+                      "labelled user IDs.")
+        step("PICK", "Renaming them will change tables that may belong to system "
+                      "accounts (aep_insights_enablement, sample_data, etc.) or "
+                      "to colleagues. Foreign renames will be tagged with the "
+                      "'[babelfish system]' suffix so they're identifiable later.")
         try:
-            confirm = input("  Proceed with batch rename? (y/N): ").strip().lower()
+            inc = input("  Type 'YES' (uppercase, exact) to INCLUDE foreign-owned "
+                         "templates, or anything else to exclude them: ").strip()
         except EOFError:
-            return False
-        if confirm in ("y", "yes"):
-            step("PICK", "Batch mode confirmed -- auto-accepting every suggestion.")
-            return True
-        step("PICK", "Cancelled batch mode; falling back to interactive.")
-    return False
+            return False, True
+        if inc != "YES":
+            exclude_foreign = True
+            step("PICK", f"Excluding {foreign_count} foreign-owned templates "
+                          f"from this batch run.")
+        else:
+            step("PICK", f"Including {foreign_count} foreign-owned templates -- "
+                          f"you accepted responsibility.")
+
+    try:
+        confirm = input("  Final confirm -- proceed with batch rename? (y/N): ").strip().lower()
+    except EOFError:
+        return False, exclude_foreign
+    if confirm in ("y", "yes"):
+        step("PICK", "Batch mode confirmed -- auto-accepting every suggestion.")
+        return True, exclude_foreign
+    step("PICK", "Cancelled batch mode; falling back to interactive.")
+    return False, exclude_foreign
 
 
 def main() -> None:
@@ -1132,10 +1190,18 @@ def main() -> None:
             step("FILTER", f"Sandbox filter: {sorted(chosen_sbs)} -> "
                             f"{len(mine)} template(s) of {before} remaining.")
 
-    # 3c. Interactive vs batch mode for the rename loop.
+    # 3c. Interactive vs batch mode for the rename loop. Batch mode also
+    #     asks whether to include foreign-owned templates (system accounts,
+    #     colleagues) -- defaults to excluding them unless you type YES.
     auto_accept = False
+    exclude_foreign = False
     if interactive and mine:
-        auto_accept = ask_rename_mode(mine)
+        auto_accept, exclude_foreign = ask_rename_mode(mine)
+    if exclude_foreign:
+        before = len(mine)
+        mine = [t for t in mine if not _is_foreign(t.get("userId", ""))]
+        step("FILTER", f"Excluded {before - len(mine)} foreign-owned template(s); "
+                        f"{len(mine)} remaining.")
 
     # 4. Print the summary table.
     rows = []
@@ -1192,17 +1258,22 @@ def main() -> None:
         sandbox = t.get("_sandbox", "")
         owner   = t.get("userId", "") or "(no userId)"
         owner_disp = _display_owner(owner)
+        is_foreign = _is_foreign(owner)
+        owner_line = (
+            f"{owner_disp}   [!] FOREIGN -- not in your my_user_ids"
+            if is_foreign else owner_disp
+        )
 
         new_name: str | None = None
         if auto_accept:
-            suggest, source = suggest_name_with_source(sql)
+            suggest, source = suggest_name_with_source(sql, owner)
             new_name = suggest
-            step("RENAME", f"[batch] {sandbox} | owner {owner_disp} | "
+            step("RENAME", f"[batch] {sandbox} | owner {owner_line} | "
                             f"{old!r} -> {suggest!r} (source: {source})")
         elif interactive:
-            suggest, source = suggest_name_with_source(sql)
+            suggest, source = suggest_name_with_source(sql, owner)
             print()
-            print(f"  Owner       : {owner_disp}")
+            print(f"  Owner       : {owner_line}")
             print(f"  Sandbox     : {sandbox}")
             print(f"  Current name: {old}")
             print(f"  Suggestion  : {suggest}")
